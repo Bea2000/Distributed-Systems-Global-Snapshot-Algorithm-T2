@@ -30,11 +30,11 @@ type Participant struct {
 	ajoAtRecord     bool
 	channelAtRecord []int
 	ajoAtMarker     AjoAtMarker
-	lastMessageId   int
 	lastSnapshotId  int
 	lastReceived    []int
 	lastSend        []int
 	lastMarker      []LastMarker
+	lastMessageId   int
 }
 
 type Action string
@@ -62,7 +62,7 @@ func createChannels(participants []Participant) {
 		messageChannels[i] = make(map[int]chan Message)
 		for j := range participants {
 			if i != j {
-				messageChannels[i][j] = make(chan Message)
+				messageChannels[i][j] = make(chan Message, 50)
 			}
 		}
 	}
@@ -84,20 +84,20 @@ func NewMessage(from int, action Action, to int) (*Message, error) {
 	return &Message{from: from, action: action, to: to, ajo: false, snapshotId: 0}, nil
 }
 
-func NewParticipant(id int) Participant {
+func NewParticipant(id int, n_participants int) Participant {
 	return Participant{
 		id:              id,
-		stateAtRecord:   []int{},
-		messageAtRecord: []int{},
+		stateAtRecord:   make([]int, n_participants),
+		messageAtRecord: make([]int, n_participants),
 		ajoAtRecord:     false,
-		channelAtRecord: []int{},
+		channelAtRecord: make([]int, n_participants),
 		ajoAtMarker:     AjoAtMarker{},
-		lastMessageId:   0,
 		lastSnapshotId:  0,
-		lastReceived:    []int{},
-		lastSend:        []int{},
+		lastReceived:    make([]int, n_participants),
+		lastSend:        make([]int, n_participants),
 		lastMarker:      []LastMarker{},
 		ajo:             false,
+		lastMessageId:   0,
 	}
 }
 
@@ -119,9 +119,9 @@ func readFile(file_path string) ([]Participant, []Message) {
 
 	var participants = make([]Participant, n_participants)
 	for i := 0; i < n_participants; i++ {
-		participants[i] = NewParticipant(i)
+		participants[i] = NewParticipant(i, n_participants)
 		if i == ajo_participant {
-			participants[i].ajoAtRecord = true
+			participants[i].ajo = true
 		}
 	}
 
@@ -150,6 +150,7 @@ func (participant *Participant) sendMessage(to int) {
 		ajo = false
 	}
 	messageChannels[participant.id][to] <- Message{from: participant.id, action: Send, to: to, ajo: ajo, snapshotId: 0}
+	fmt.Println(participant.id, "SENT MESSAGE to", to)
 	participant.lastSend[to] = participant.lastSend[to] + 1
 }
 
@@ -165,6 +166,7 @@ func markerExists(participant *Participant, marker LastMarker) int {
 func (participant *Participant) receiveMessage(from int, participants []Participant) {
 	message := <-messageChannels[from][participant.id]
 	if message.action == Marker {
+		fmt.Println(participant.id, "RECEIVED MARKER from", message.from)
 		marker := LastMarker{message.snapshotId, message.from, 0}
 		marker_index := markerExists(participant, marker)
 		if marker_index == -1 {
@@ -172,13 +174,18 @@ func (participant *Participant) receiveMessage(from int, participants []Particip
 			participant.stateAtRecord = participant.lastSend
 			participant.messageAtRecord = participant.lastReceived
 			participant.ajoAtRecord = participant.ajo
+			for i := range participants {
+				if i != participant.id {
+					messageChannels[participant.id][i] <- Message{from: message.from, action: Marker, to: i, ajo: false, snapshotId: message.snapshotId}
+					fmt.Println(participant.id, "SENT MARKER to", i)
+				}
+			}
 		} else {
 			participant.lastMarker[marker_index].count = participant.lastMarker[marker_index].count + 1
 			if message.ajo {
 				participant.ajo = true
 				participant.ajoAtMarker = AjoAtMarker{boolValue: true, intValue: participant.id}
 			}
-			participant.channelAtRecord[from] = participant.channelAtRecord[from] + 1
 			if marker.participantId == participant.id {
 				if participant.lastMarker[marker_index].count == len(participants)-1 {
 					registerSnapshot(*participant, participants, marker.snapshotId)
@@ -191,9 +198,14 @@ func (participant *Participant) receiveMessage(from int, participants []Particip
 	if message.ajo {
 		participant.ajo = true
 	}
+	if len(participant.lastMarker) > 0 {
+		participant.channelAtRecord[from] = participant.channelAtRecord[from] + 1
+	}
+	fmt.Println(participant.id, "RECEIVED MESSAGE from", from)
 }
 
 func (participant *Participant) wait(seconds int) {
+	fmt.Println(participant.id, "WAIT for", seconds, "seconds")
 	time.Sleep(time.Duration(seconds) * time.Second)
 }
 
@@ -205,16 +217,19 @@ func (participant *Participant) snapshot(participants []Participant) {
 
 	for i := range participants {
 		if i != participant.id {
-			messageChannels[participant.id][i] <- Message{from: participant.id, action: Snapshot, to: i, ajo: false, snapshotId: participant.lastSnapshotId}
+			messageChannels[participant.id][i] <- Message{from: participant.id, action: Marker, to: i, ajo: false, snapshotId: participant.lastSnapshotId}
+			fmt.Println(participant.id, "SEND SNAPSHOT to", i)
 		}
 	}
 	participant.lastSnapshotId = participant.lastSnapshotId + 1
 }
 
-func (participant *Participant) processMessages(messages []Message, participants []Participant) {
-	for i := participant.lastMessageId + 1; i < len(messages); i++ {
+func (participant *Participant) processMessages(messages []Message, participants []Participant, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i := participant.lastMessageId; i < len(messages); i++ {
 		message := messages[i]
 		if message.from == participant.id {
+			participant.lastMessageId = i + 1
 			switch message.action {
 			case Send:
 				participant.sendMessage(message.to)
@@ -230,6 +245,7 @@ func (participant *Participant) processMessages(messages []Message, participants
 }
 
 func registerSnapshot(participant Participant, participants []Participant, snapshotId int) {
+	fmt.Println("REGISTERED SNAPSHOT", snapshotId)
 	filename := fmt.Sprintf("snapshot_%d.txt", snapshotId)
 	file, err := os.Create(filename)
 	if err != nil {
@@ -281,10 +297,9 @@ func main() {
 
 	for i := range participants {
 		wg.Add(1)
-		go func(participant Participant) {
-			defer wg.Done()
-			participant.processMessages(messages, participants)
-		}(participants[i])
+		go func(participant *Participant) {
+			participant.processMessages(messages, participants, &wg)
+		}(&participants[i])
 	}
 
 	wg.Wait()
